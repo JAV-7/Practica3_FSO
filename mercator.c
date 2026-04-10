@@ -1,4 +1,14 @@
-/*           
+/*      
+	Practica 03 - SemAforos
+	Estudiantes:
+		Francisco Javier Ramos JImEnez
+		JesUs Alejandro de la Rosa Arroyo
+	Profesor:
+		JosE Luis ELvira Valenzuela	
+	Materia: 
+		Fundamentos de Sistemas Operativos
+	16/04/2026
+	
         Para compilar incluir la librería  m (matemáticas)
         Ejemplo:
             gcc -o mercator mercator.c  -lm
@@ -10,8 +20,11 @@
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <sys/shm.h>
-#include <semaphore.h> // Cabecera para especIfico para manejo de semAforos
-#include <fcntl.h> // Llamada al sistema de Unix/Linux utilizada para manipular descriptores de archivos abiertos
+// Cabecera para especIfico para manejo de semAforos de POSIX
+#include <semaphore.h>
+// Llamada al sistema de Unix/Linux utilizada para manipular descriptores de archivos abiertos
+#include <fcntl.h>
+// DefiniciOn de tipos
 #include <sys/types.h>
 
 #define NPROCS 4
@@ -23,7 +36,14 @@ typedef struct {
     int start_all;
     double x_val;
     double res;
-    sem_t mutex; // SemAforo para indicar espera de procesos para afectar variable global
+    /* En un principio, se intentO implementar los semAforos fuera de la estructura, sin embargo,
+     * esto representO un problema; cada proceso se estancaba en wait. Tras checar dicho problema,
+     * nos percatamos que pareciera que cada proceso tenIa un semAforo propio debido a cOMo se definen
+     * estos en main. Primero, se intentO declararlos a nivel de archivo, pero generO errores.
+     * Entonces, se decidiO incluirlos dentro de la estructura shared, la cual asegura que TODOS 
+     * los procesos tienen acceso a esta.
+     */
+    sem_t mutex; // SemAforo para indicar espera de procesos para afectar proc_count
     sem_t s_start; // SemAforo para indicar arranque de procesos
     sem_t s_finish; // SemAforo para indicar fin de procesos
 } SHARED;
@@ -46,22 +66,27 @@ double get_member(int n, double x)
 void proc(int proc_num)
 {
     int i;
-    // INICIO DE SECCION CRITICA
+    // Inicio de secciOn de cAlculo
     printf("Proceso %d en espera de semaforo\n", proc_num);
-    sem_wait(&shared->s_start);
+    sem_wait(&shared->s_start); // Espera a instrucciOn para arrancar cAlculo
     printf("Proceso %d entra a zona de calculo\n", proc_num);
     // Cada proceso realiza el cálculo de los términos que le tocan
     shared->sums[proc_num] = 0;
     for(i=proc_num; i<SERIES_MEMBER_COUNT;i+=NPROCS)
         shared->sums[proc_num] += get_member(i+1, shared->x_val);
-    // Incrementa la variable proc_count que es la cantidad de procesos que terminaron su cálculo
+    
     printf("Proceso %d sale de zona de calculo\n", proc_num);
+    // Zona de semAforo mutex, que asegura la modificaciOn de proc_count sin que se sobreescriba
     sem_wait(&shared->mutex);
     printf("Proceso %d entra a zona de mutex\n", proc_num);
+    // Incrementa la variable proc_count que es la cantidad de procesos que terminaron su cálculo
     shared->proc_count++;
-    if(shared->proc_count == NPROCS)
+    // Si proc_count llega a ser igual al nUmero de procesos, le hace post al semAforo s_finish
+    if(shared->proc_count == NPROCS) 
+    	// SeNal de que se terminaron los cAlculos individuales
     	sem_post(&shared->s_finish);
     printf("Proceso %d sale de zona de mutex\n", proc_num);
+    // Libera el semAforo para que el siguiente proceso pueda entrar a la SC
     sem_post(&shared->mutex);
     exit(0);
 }
@@ -78,11 +103,17 @@ void master_proc()
     fclose(fp);
     // InstrucciOn para que empiecen los calculos de todos los procesos
     printf("Se leyO el archivo\n");
-    shared->start_all = 1;
+    /* shared->start_all = 1; Esta instrucciOn queda obsoleta debido a la implementaciOn 
+     * del semAforo s_start
+     */
     for(i = 0; i < NPROCS; i++)
     	sem_post(&shared->s_start);
 
-    // Espera a que todos los procesos terminen su cálculo
+    /* Espera a que todos los procesos terminen su cálculo.
+     * Solo se activa una vez, aunque otra alternativa es poner s_wait en proc() a nivel
+     * de sem_post(&shared->mutex) despuEs de este y tratar el sem_wait(&shared->s_finish)
+     * con un ciclo for de NPROCS tal como en sem_post(&shared->s_start) 
+     */
     sem_wait(&shared->s_finish);
     // Una vez que todos terminan, suma el total de cada uno
     shared->res = 0;
@@ -106,8 +137,27 @@ int main()
     int status;
 
     // Solicita y conecta la memoria compartida
+    
+    /* Se modificO esta lInea de cOdigo debido a segmentation fault e invalid argument.
+     * IPC_PRIVATE le indica al SO que implemente un segmento Unico y privado, a diferencia
+     * del anterior. Se evita el uso de comandos como ipcrm para limpiar buffer.
+     * Si se le asigna -1 a shmid, significa que hubo un error. En dicho caso, abortar el
+     * programa.
+     */
    shmid = shmget(IPC_PRIVATE, sizeof(SHARED), 0666 | IPC_CREAT);
+   if (shmid == -1) {
+   	perror("shmget");
+   	exit(1);
+   }
    
+   /* Al compilar el programa tras hacer los cambios de semAforos, se generO un error
+    * de segmentation fault en esta variable. La razOn: se accedIa a momeoria invAlida.
+    * SI algo fallaba en la asignaciOn de shared, se le asignaba (void *) -1.
+    * En este cambio, se verifica si se le asignO un valor invAlido. SI sucede, aborta el
+    * programa y comunica el error.
+    * En caso de no funcionar, deberIa limpiarse el buffer. Correr ipcs -m y buscar el proceso
+    * a borrar con ipcrm -m <ID>
+    */
    shared = shmat(shmid, NULL, 0);
    if (shared == (void *) -1) {
       perror("shmat");
@@ -118,9 +168,13 @@ int main()
     shared->proc_count = 0;
     shared->start_all = 0;
     
-    // DeclaraciOn de semAforos
+    /* DeclaraciOn de semAforos
+     * s_finish inicia en 0, el 1 indica que es compartido entre procesos. NOTA: si es 0,
+     * significa que es un semAforo compartido entre hilos, lo cual no se busca en esta practica.
+     */
     sem_init(&shared->s_finish, 1, 0);
     sem_init(&shared->s_start, 1, 0);
+    // Mutex inicializado en 1, indicando que el primer proceso que llegue puede acceder a la secciOn.
     sem_init(&shared->mutex, 1, 1);
     
     
@@ -155,6 +209,10 @@ int main()
     printf("El resultado es %10.8f\n", shared->res);
     printf("Llamando a la función ln(1 + %f) = %10.8f\n",shared->x_val, log(1+shared->x_val));
     // Desconecta y elimnina la memoria compartida
+    // sem_destroy libera los recursos del sistema usados por semAforos POSIX
+    sem_destroy(&shared->s_start);
+    sem_destroy(&shared->s_finish);
+    sem_destroy(&shared->mutex);
     shmdt(shared);
     shmctl(shmid,IPC_RMID,NULL);
 }
